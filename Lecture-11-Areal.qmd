@@ -1,0 +1,1239 @@
+---
+title: "Notes 11: Areal Data and Disease Mapping"
+subtitle: "Advanced Statistical Methods"
+keep-tex: true
+format:
+  pdf:
+    number-sections: true
+    number-depth: 3
+    geometry: "margin = 1in"
+    fontsize: "12pt"
+    documentclass: article
+    pdf-engine: pdflatex
+    include-in-header:
+      - text: |
+          \usepackage{xcolor}
+          \fvset{samepage=true}
+          \widowpenalty=10000
+          \clubpenalty=10000
+          \newcommand{\bA}{\boldsymbol A}
+          \newcommand{\bb}{\boldsymbol b}
+          \newcommand{\bc}{\boldsymbol c}
+          \newcommand{\bD}{\boldsymbol D}
+          \newcommand{\bQ}{\boldsymbol Q}
+          \newcommand{\bW}{\boldsymbol W}
+          \newcommand{\by}{\boldsymbol y}
+          \newcommand{\bZ}{\boldsymbol Z}
+          \newcommand{\LOO}{\operatorname{LOO}}
+          \newcommand{\bbeta}{\boldsymbol{\beta}}
+          \newcommand{\bepsilon}{\boldsymbol{\epsilon}}
+          \newcommand{\bH}{\boldsymbol{H}}
+          \newcommand{\bmu}{\boldsymbol{\mu}}
+          \newcommand{\bX}{\boldsymbol{X}}
+          \newcommand{\bY}{\boldsymbol{Y}}
+          \newcommand{\Bernoulli}{\operatorname{Bernoulli}}
+          \newcommand{\Binomial}{\operatorname{Binomial}}
+          \newcommand{\Cor}{\operatorname{Cor}}
+          \newcommand{\Cov}{\operatorname{Cov}}
+          \newcommand{\E}{\operatorname{E}}
+          \newcommand{\Gam}{\operatorname{Gamma}}
+          \newcommand{\Identity}{\mathrm{I}}
+          \newcommand{\logit}{\operatorname{logit}}
+          \newcommand{\MSE}{\operatorname{MSE}}
+          \newcommand{\NegBin}{\operatorname{NegBin}}
+          \newcommand{\Normal}{\operatorname{Normal}}
+          \newcommand{\Odds}{\operatorname{Odds}}
+          \newcommand{\Poisson}{\operatorname{Poisson}}
+          \newcommand{\RMSE}{\operatorname{RMSE}}
+          \newcommand{\SD}{\operatorname{SD}}
+          \newcommand{\SE}{\text{Std. Error}}
+          \newcommand{\SMR}{\operatorname{SMR}}
+          \newcommand{\Var}{\operatorname{Var}}
+          \newcommand{\expit}{\operatorname{expit}}
+          \newcommand{\zeros}{\boldsymbol 0}
+bibliography: "bib/mybib.bib"
+cache: true
+---
+
+# Motivation
+
+In Notes 10 we looked at _point-referenced_ data, where every observation comes with its own latitude and longitude. These notes cover a second type of spatial data: _areal_ data, where each observation is a summary of a _region_. Examples include counties,  census tracts, ZIP codes, school districts, and states.
+
+Areal data are everywhere in epidemiology and public health, largely for privacy reasons: a health department will happily tell you how many people died of something in a given county, but does not want to give identifying information about specific people. Our goals are the same as in Notes 10. We still want to account for dependence, borrow information from nearby places, and worry about spatial confounding. The tools look a bit different, however, as the notion of "distance between locations" gets replaced by the notion of which regions _border_ each other.
+
+
+## Example: COVID-19 Deaths in Texas, 2020
+
+Our running example is focused on the question "_during 2020, before vaccines were widely available, where in Texas did COVID-19 kill more people than we would have expected?_" To answer it, we combine several public data sources:
+
+- __Deaths:__ cumulative COVID-19 deaths in each county as of December 31, 2020, compiled by the [New York Times](https://github.com/nytimes/covid-19-data) from state and local health departments.
+- __Population by age:__ the Census Bureau's [county population estimates](https://www.census.gov/data/tables/time-series/demo/popest/2020s-counties-detail.html) for July 2020.
+- __Deaths by age:__ Texas COVID-19 deaths in 2020 broken down by age group, from the CDC's [provisional COVID-19 death counts](https://data.cdc.gov/NCHS/Provisional-COVID-19-Deaths-by-Sex-and-Age/9bhg-hcku).
+- __County characteristics:__ health insurance coverage, rurality, and income from the [County Health Rankings](https://www.countyhealthrankings.org/) (2022 release).
+- __County boundaries:__ the Census Bureau's [cartographic boundary files](https://www.census.gov/geographies/mapping-files/time-series/geo/cartographic-boundary.html).
+
+In addition to all of us living here, Texas has a few things going for it for this type of analysis. It has 254 counties (more than any other state) ranging in population from 67 (Loving County, the least populous county in the country) to 4.7 million (Harris County, which contains Houston).
+
+```{r, message = FALSE, warning = FALSE}
+#| label: tx-load
+#| echo: false
+
+## install.packages(c("sf", "mgcv", "patchwork", "ggrepel"))
+library(tidyverse)
+library(sf)
+library(patchwork)
+
+## Each source is downloaded once and saved as a small Texas-only file
+tx_dir <- "data/texas-covid"
+dir.create(tx_dir, showWarnings = FALSE, recursive = TRUE)
+options(timeout = 600)
+
+download_temp <- function(url) {
+  path <- tempfile()
+  download.file(url, path, mode = "wb", quiet = TRUE)
+  path
+}
+
+## Read a saved file, creating it with make_file() if it doesn't exist yet
+read_saved <- function(file, make_file) {
+  path <- file.path(tx_dir, file)
+  if (!file.exists(path)) write_csv(make_file(), path)
+  read_csv(path, col_types = cols(fips = "c"))
+}
+
+## (1) Cumulative COVID-19 deaths by county on Dec 31, 2020 (NYT)
+tx_deaths <- read_saved("tx-covid-deaths-2020.csv", function() {
+  "https://raw.githubusercontent.com/nytimes/covid-19-data/master/us-counties-2020.csv" %>%
+    download_temp() %>%
+    read_csv(col_types = cols(fips = "c")) %>%
+    filter(state == "Texas", date == as.Date("2020-12-31"), !is.na(fips)) %>%
+    select(fips, deaths)
+})
+
+## (2) County population by age group, July 1, 2020 (Census Bureau)
+tx_age <- read_saved("tx-population-by-age-2020.csv", function() {
+  paste0(
+    "https://www2.census.gov/programs-surveys/popest/datasets/",
+    "2020-2021/counties/asrh/cc-est2021-agesex-48.csv"
+  ) %>%
+    download_temp() %>%
+    read_csv(col_types = cols(STATE = "c", COUNTY = "c")) %>%
+    filter(YEAR == 2) %>%  # YEAR = 2 is the July 1, 2020 estimate
+    transmute(
+      fips = paste0(STATE, COUNTY),
+      name = str_remove(CTYNAME, " County$"),
+      `0-24` = AGE04_TOT + AGE59_TOT + AGE1014_TOT + AGE1519_TOT + AGE2024_TOT,
+      `25-34` = AGE2529_TOT + AGE3034_TOT,
+      `35-44` = AGE3539_TOT + AGE4044_TOT,
+      `45-54` = AGE4549_TOT + AGE5054_TOT,
+      `55-64` = AGE5559_TOT + AGE6064_TOT,
+      `65-74` = AGE6569_TOT + AGE7074_TOT,
+      `75-84` = AGE7579_TOT + AGE8084_TOT,
+      `85+` = AGE85PLUS_TOT
+    ) %>%
+    pivot_longer(-c(fips, name), names_to = "age", values_to = "n")
+})
+
+## (3) Texas COVID-19 deaths in 2020 by age group (CDC/NCHS). Deaths under
+## age 5 are suppressed because there were so few, so "0-24" uses ages 5-24.
+tx_age_deaths <- read_saved("tx-covid-deaths-by-age-2020.csv", function() {
+  age_lookup <- tibble(
+    age_group = c("5-14 years", "15-24 years", "25-34 years", "35-44 years",
+                  "45-54 years", "55-64 years", "65-74 years", "75-84 years",
+                  "85 years and over"),
+    age = c("0-24", "0-24", "25-34", "35-44", "45-54", "55-64", "65-74",
+            "75-84", "85+")
+  )
+  paste0(
+    "https://data.cdc.gov/resource/9bhg-hcku.csv?state=Texas&year=2020",
+    "&sex=All%20Sexes&$where=%60group%60%3D%27By%20Year%27"
+  ) %>%
+    download_temp() %>%
+    read_csv(show_col_types = FALSE) %>%
+    inner_join(age_lookup, by = "age_group") %>%
+    group_by(age) %>%
+    summarise(deaths = sum(covid_19_deaths))
+})
+
+## (4) County characteristics (County Health Rankings, 2022 release)
+tx_chr <- read_saved("tx-county-health-rankings-2022.csv", function() {
+  paste0(
+    "https://www.countyhealthrankings.org/sites/default/files/",
+    "media/document/analytic_data2022.csv"
+  ) %>%
+    download_temp() %>%
+    read_csv(  # the first row holds long variable names, so skip it
+      skip = 1,
+      col_types = cols(statecode = "c", countycode = "c", fipscode = "c")
+    ) %>%
+    filter(statecode == "48", countycode != "000") %>%
+    transmute(
+      fips = fipscode,
+      uninsured = v085_rawvalue,  # fraction of people under 65 uninsured
+      rural = v058_rawvalue,      # fraction of residents in rural areas
+      income = v063_rawvalue,     # median household income
+      hispanic = v056_rawvalue    # fraction Hispanic
+    )
+})
+
+## (5) County boundaries (Census cartographic boundary file)
+tx_shape_file <- file.path(tx_dir, "tx-counties.gpkg")
+if (!file.exists(tx_shape_file)) {
+  shape_dir <- tempfile()
+  "https://www2.census.gov/geo/tiger/GENZ2020/shp/cb_2020_us_county_20m.zip" %>%
+    download_temp() %>%
+    unzip(exdir = shape_dir)
+  st_read(file.path(shape_dir, "cb_2020_us_county_20m.shp"), quiet = TRUE) %>%
+    filter(STATEFP == "48") %>%
+    transmute(fips = GEOID) %>%
+    st_write(tx_shape_file, quiet = TRUE)
+}
+
+## Put everything together, one row per county
+tx_pop <- tx_age %>%
+  group_by(fips, name) %>%
+  summarise(pop = sum(n), .groups = "drop")
+
+tx <- st_read(tx_shape_file, quiet = TRUE) %>%
+  left_join(tx_pop, by = "fips") %>%
+  left_join(tx_deaths, by = "fips") %>%
+  left_join(tx_chr, by = "fips") %>%
+  mutate(rate = 1e5 * deaths / pop) %>%
+  arrange(fips) %>%
+  st_transform(3083)  # Texas-centric Albers equal-area projection
+
+## Shared pieces for the maps
+tx_cities <- tibble(
+  city = c("Houston", "Dallas", "Austin", "San Antonio", "El Paso",
+           "Lubbock", "Amarillo", "Laredo", "McAllen"),
+  long = c(-95.37, -96.80, -97.74, -98.49, -106.49, -101.86, -101.83,
+           -99.48, -98.23),
+  lat = c(29.76, 32.78, 30.27, 29.42, 31.76, 33.58, 35.22, 27.53, 26.20)
+) %>%
+  st_as_sf(coords = c("long", "lat"), crs = 4326) %>%
+  st_transform(3083)
+
+city_layers <- list(
+  geom_sf(data = tx_cities, size = 0.8),
+  geom_sf_text(data = tx_cities, aes(label = city), size = 2.6,
+               nudge_y = 30000, fontface = "bold")
+)
+
+county_layer <- function(mapping, ...) {
+  geom_sf(mapping, color = "grey60", linewidth = 0.1, ...)
+}
+
+## Ratios like the SMR are mapped on the log scale, clipped to [1/4, 4]
+clip_log <- function(x) log(pmin(pmax(x, 1 / 4), 4))
+
+smr_scale <- function(name = "SMR") {
+  scale_fill_gradient2(
+    low = "#2166AC",
+    mid = "grey97",
+    high = "#B2182B",
+    midpoint = 0,
+    limits = log(c(1 / 4, 4)),
+    breaks = log(c(1 / 4, 1 / 2, 1, 2, 4)),
+    labels = c("1/4", "1/2", "1", "2", "4"),
+    name = name
+  )
+}
+```
+
+If you want to follow along, [downloading and running this script](https://raw.githubusercontent.com/theodds/SDS-348/refs/heads/master/Texas.R) will (as of 11/18/2026) create the following datasets:
+
+- `tx`, a county `sf` object. Almost everything later uses it.
+- `tx_age`, the county-by-age-group population counts.
+- `tx_age_deaths`, the Texas deaths by age group.
+
+The Quarto file reproducing this document (which includes code reproducing all of the figures) is also available [at this link](https://raw.githubusercontent.com/theodds/SDS-348/refs/heads/master/Lecture-11-Areal.qmd). 
+
+The `tx` dataset is an `sf` object, which is a special kind of data frame that contains a geometry column (`geom`) that lets us define shapes for each county, determine the centers of each county (`st_centroid()`), determine which counties neighbor each other (`st_touches()`), and so forth.
+
+The first few rows look like this:
+
+```{r}
+#| label: head
+
+head(tx)
+```
+
+
+It contains the name of the county (`name`), its population (`pop`), the number of COVID deaths measured (`deaths`), the proportion of people under 65 in the county without health insurance (`uninsured`), the proportion of individuals who live in rural areas (`rural`), the median household income (`income`), the proportion of residents who are Hispanic (`hispanic`), and the raw death rate per 100,000 residents (`rate`). It also has a geometry column (`geom`) holding the county's boundary, which is what lets us draw maps and figure out which counties border each other.
+
+ The `sf` package also lets us do things like make maps using the `geom` column; for example, we can visualize how the death rate varies across Texas with: 
+
+```{r}
+#| label: first-map
+
+ggplot(tx) + geom_sf(aes(fill = rate)) + theme_bw()
+```
+
+
+```{r, fig.width = 6.5, fig.height = 6}
+#| label: fig-tx-rate
+#| dependson: tx-load
+#| echo: false
+#| fig-cap: "COVID-19 deaths per 100,000 residents in each Texas county during 2020."
+
+library(tidyverse)
+library(sf)
+library(patchwork)
+
+ggplot(tx) +
+  county_layer(aes(fill = rate)) +
+  city_layers +
+  scale_fill_viridis_c(
+    option = "magma",
+    direction = -1,
+    name = "Deaths per\n100,000"
+  ) +
+  theme_void()
+```
+
+@fig-tx-rate gives a more sophisticated version of this picture. There is a lot going on here: high rates along the Rio Grande and in the counties around Lubbock, and low rates in the suburbs of Austin and Dallas. But before reading too much into this map, it is worth looking at the counties with the most extreme rates. Below we look at the top five and bottom five counties in terms of death rate per 100,000.
+
+
+```{r}
+#| label: tx-extremes
+#| dependson: tx-load
+#| echo: true
+
+tx_extremes <- st_drop_geometry(tx) %>% ## Gets rid of geometry column
+  arrange(desc(rate)) %>%
+  slice(c(1:5, (n() - 4):n())) %>%
+  transmute(
+    County = name,
+    Population = scales::comma(pop),
+    Deaths = deaths,
+    `Deaths per 100,000` = round(rate)
+  )
+
+knitr::kable(tx_extremes) ## Pretty table
+```
+
+These are not the places you would point to as the worst and best hit areas of the state. Kenedy County has the highest rate, but it has 346 residents and recorded 2 deaths. At the other end, four counties had no deaths at all, and all four have fewer than 1,600 residents. A single death in Loving County would have given it a rate of about 1,500 per 100,000, about two and a half times the rate in Kenedy County. Small areas produce extreme rates, in both directions, just by chance. In the context of areal data, this is sometimes called a _small area estimation_ problem.
+
+
+## Expected Counts and Standardized Mortality Ratios
+
+The raw death rate has a second problem: it ignores age. Famously, older people have higher COVID-19 mortality rates; using the CDC numbers for Texas:
+
+```{r}
+#| label: tx-age-rates
+#| dependson: tx-load
+#| echo: false
+
+## Statewide death rate in each age group
+age_rates <- tx_age %>%
+  group_by(age) %>%
+  summarise(n = sum(n)) %>%
+  left_join(tx_age_deaths, by = "age") %>%
+  mutate(rate = deaths / n)
+
+age_rates %>%
+  transmute(
+    Age = age,
+    Population = scales::comma(n),
+    Deaths = scales::comma(deaths),
+    `Deaths per 100,000` = round(1e5 * rate, 1)
+  ) %>%
+  knitr::kable()
+```
+
+The CDC suppresses death counts for children under 5 because there are so few of them, so the "0-24" row counts deaths at ages 5-24 only; this slightly understates the rate for the youngest group, but makes essentially no difference to anything that follows. The death rate for Texans aged 85 and over was more than 2,000 times the rate for those under 25. Counties also have different age demographics: counties in the Hill Country and the Big Bend region are much older than the counties along the border or the big metro areas. If we don't account for age, "high COVID-19 mortality" partly just means "old."
+
+
+The standard fix in epidemiology is _indirect standardization_. Let $r_a$ denote the statewide death rate in age group $a$ (the last column of the table above divided by 100,000) and let $n_{ia}$ be the number of people in county $i$ who are in age group $a$. The _expected count_ for county $i$ is
+
+$$
+  E_i = \sum_a n_{ia} \, r_a,
+$$
+
+which is the number of deaths county $i$ would have had if each of its age groups died at the statewide rate. Comparing what we observed with what we expected gives the _standardized mortality ratio_ (SMR)
+
+$$
+  \SMR_i = \frac{Y_i}{E_i},
+$$
+
+where $Y_i$ is the number of deaths in county $i$. An SMR of $1$ means the county had as many deaths as we would expect given its age structure, an SMR of $2$ means it had twice as many, and so forth.
+
+The following code uses the `tx_age` dataset to compute the expected counts (`E`) and the SMR (`smr`) and then adds these as columns to the `tx` dataset:
+
+```{r}
+#| label: tx-expected
+#| dependson: tx-age-rates
+
+## Apply the statewide age-specific rates to each county's age distribution
+tx_expected <- tx_age %>%
+  left_join(age_rates %>% select(age, rate), by = "age") %>%
+  group_by(fips) %>%
+  summarise(E = sum(n * rate))
+
+## The CDC and NYT count deaths a bit differently, so rescale the expected
+## counts so that they add up to the observed number of deaths
+tx <- tx %>%
+  left_join(tx_expected, by = "fips") %>%
+  mutate(
+    E = E * sum(deaths) / sum(E),
+    smr = deaths / E
+  )
+```
+
+:::{.callout-note}
+#### Data Processing Note
+
+The rescaling in the last step is a small technical point: the CDC total for Texas is about 19% higher than the NYT total, so we forced $\sum_i E_i = \sum_i Y_i$. This ensures that an SMR of $1$ corresponds to the death rate of Texas as a whole.
+:::
+
+@fig-tx-expected shows the expected death rate $E_i / \text{population}_i$. This map is _only_ about age structure: it is what the death rate would look like if every age group in every county died at the statewide rate. @fig-tx-smr then shows the SMRs. Compared to @fig-tx-rate, the border counties look even worse after accounting for age (they are relatively young, so they "should" have had few deaths), while the older counties in the Hill Country and Big Bend look better.
+
+```{r, fig.width = 6.5, fig.height = 6}
+#| label: fig-tx-expected
+#| dependson: tx-expected
+#| echo: false
+#| fig-cap: "Expected COVID-19 deaths per 100,000 residents based only on each county's age distribution, i.e., assuming that COVID-19 affects each county equally."
+
+ggplot(tx) +
+  county_layer(aes(fill = 1e5 * E / pop)) +
+  city_layers +
+  scale_fill_viridis_c(name = "Expected deaths\nper 100,000") +
+  theme_void()
+```
+
+```{r, fig.width = 6.5, fig.height = 6}
+#| label: fig-tx-smr
+#| dependson: tx-expected
+#| echo: false
+#| fig-cap: "Standardized mortality ratios (observed deaths divided by expected deaths). Red counties had more deaths than expected given their age structure, and blue counties had fewer. The SMR was capped above and below 1/4 and 4 to stop outliers from dominating the figure."
+
+ggplot(tx) +
+  county_layer(aes(fill = clip_log(smr))) +
+  city_layers +
+  smr_scale() +
+  theme_void()
+```
+
+# Poisson Loglinear GLMMs for Areal Counts
+
+## The SMR is a Maximum Likelihood Estimate
+
+A natural starting point for modeling death counts is to use a Poisson model
+
+$$
+  Y_i \sim \Poisson(E_i \, \theta_i),
+$$
+
+where $\theta_i$ is the _relative risk_ in county $i$: $\theta_i = 1.5$ means that people in county $i$ die at 1.5 times the rate we would expect given its age structure. On the log scale the mean is $\log(E_i \, \theta_i) = \log E_i + \log \theta_i$, so $\log E_i$ enters as an _offset_, just like the enrollment in the campus crime example from Notes 3.
+
+If we treat each $\theta_i$ as its own unknown parameter, the maximum likelihood estimate is $\widehat \theta_i = Y_i / E_i = \SMR_i$. So the SMR map is a "no pooling" estimate: each county is estimated using only its own data. The trouble is the variance:
+
+$$
+  \Var(\SMR_i) = \frac{\Var(Y_i)}{E_i^2} = \frac{\theta_i}{E_i}.
+$$
+
+For Harris County, $E_i \approx 3{,}971$, so the standard deviation of the SMR is about $0.016 \sqrt{\theta_i}$, which is quite precise. For Loving County, on the other hand, $E_i \approx 0.03$, so the standard deviation is roughly $5.77 \sqrt{\theta_i}$, which is around 360 times as large (holding $\theta_i$ fixed). Moreover, Loving County's SMR is either $0$ (no deaths) or at least $32$ (one or more deaths); neither number tells us much about the actual risk in Loving County.
+
+@fig-tx-funnel makes this concrete with a _funnel plot_. The dashed lines show the range we would expect for (at least) 95% of counties if _every_ county had relative risk $\theta_i = 1$; they jump around because death counts are whole numbers. Two things stand out:
+
+1. The extreme SMRs belong to counties with small $E_i$, which is what we expect from noise alone.
+2. Many large counties fall well outside the funnel. Hidalgo County (McAllen) had about three times the expected number of deaths, while Collin County (north of Dallas) had less than half. These differences are far too large to be noise.
+
+
+```{r, fig.width = 7, fig.height = 4.5}
+#| label: fig-tx-funnel
+#| dependson: tx-expected
+#| echo: false
+#| warning: false
+#| fig-cap: "Funnel plot of SMR against expected deaths. Dashed lines show the 2.5% and 97.5% quantiles of the SMR if a county had relative risk 1, so that at least 95% of SMRs should fall between them; SMRs above 4.5 are not shown."
+
+## The 2.5% and 97.5% quantiles of Y / E when Y ~ Poisson(E); the limits
+## jump because Y can only take whole-number values
+funnel <- tibble(E = exp(seq(log(0.026), log(5000), length.out = 5000))) %>%
+  mutate(
+    lower = qpois(0.025, lambda = E) / E,
+    upper = qpois(0.975, lambda = E) / E
+  )
+
+funnel_labels <- st_drop_geometry(tx) %>%
+  filter(name %in% c("Loving", "Kenedy", "Lamb", "Hidalgo", "Collin",
+                     "Harris", "El Paso", "Travis"))
+
+ggplot(st_drop_geometry(tx), aes(x = E, y = smr)) +
+  geom_hline(yintercept = 1, color = "grey50") +
+  geom_line(data = funnel, aes(y = lower), linetype = "dashed") +
+  geom_line(data = funnel, aes(y = upper), linetype = "dashed") +
+  geom_point(alpha = 0.6) +
+  ggrepel::geom_label_repel(
+    data = funnel_labels,
+    aes(label = name),
+    size = 3,
+    min.segment.length = 0
+  ) +
+  scale_x_log10(labels = scales::label_comma()) +
+  coord_cartesian(ylim = c(0, 4.5)) +
+  labs(x = "Expected deaths (log scale)", y = "SMR") +
+  theme_bw()
+```
+
+## Partial Pooling with Independent Random Effects
+
+To some extent, we already know how to fix this issue: _shrinkage_, also known as _partial pooling_. Consider the model
+
+$$
+  Y_i \sim \Poisson(E_i \, \theta_i), \qquad
+  \log \theta_i = \beta_0 + u_i, \qquad
+  u_i \stackrel{\text{iid}}{\sim} \Normal(0, \sigma^2_u).
+$$
+
+This is just the Poisson GLMM from Notes 8, where each county is its own "cluster" with exactly one observation. Counties with lots of data (large $E_i$) will be estimated mostly from their own data, while counties with little data get pulled toward the typical value $e^{\beta_0}$. As a bonus, the random effect also takes care of overdispersion, which is severe here: a quasi-Poisson GLM with only an intercept has an estimated dispersion of about 44.
+
+We can fit this with `gam()`, using `bs = "re"` as in Notes 9:
+
+```{r}
+#| label: tx-iid
+#| dependson: tx-expected
+#| message: false
+#| warning: false
+library(mgcv)
+
+## One row per county, without the geometry
+tx_df <- st_drop_geometry(tx) %>%
+  mutate(county = factor(fips, levels = fips))
+
+tx_iid <- gam(
+  deaths ~ s(county, bs = "re") + offset(log(E)),
+  family = poisson,
+  data = tx_df,
+  method = "REML"
+)
+
+gam.vcomp(tx_iid)
+```
+
+
+The estimated standard deviation is $\widehat \sigma_u \approx 0.57$, so a county one standard deviation above the typical county has a relative risk about $e^{0.57} \approx 1.8$ times as high. The _smoothed_ SMRs are the fitted relative risks $\widehat \theta_i = \exp(\widehat \beta_0 + \widehat u_i)$, and @fig-tx-shrink-iid compares them to the raw SMRs.
+
+```{r, fig.width = 6.5, fig.height = 5}
+#| label: fig-tx-shrink-iid
+#| dependson: tx-iid
+#| echo: false
+#| fig-cap: 'Smoothed SMRs from the independent random effects model against the raw SMRs. Point size reflects the expected number of deaths. The dashed line represents no shrinkage, and the horizontal line is the typical value $e^{\widehat \beta_0}$.'
+
+## Fitted relative risks: the linear predictor minus the offset
+tx_df$smr_iid <- exp(predict(tx_iid) - log(tx_df$E))
+
+shrink_labels <- tx_df %>%
+  filter(name %in% c("Loving", "Kenedy", "Lamb", "Hidalgo", "Borden",
+                     "Jeff Davis"))
+
+ggplot(tx_df, aes(x = smr, y = smr_iid)) +
+  geom_abline(linetype = "dashed") +
+  geom_hline(yintercept = exp(coef(tx_iid)[1]), color = "grey50") +
+  geom_point(aes(size = E), alpha = 0.5) +
+  ggrepel::geom_label_repel(
+    data = shrink_labels,
+    aes(label = name),
+    size = 3,
+    min.segment.length = 0
+  ) +
+  scale_size_continuous(
+    range = c(0.3, 6),
+    transform = "log10",
+    breaks = c(1, 10, 100, 1000),
+    name = "Expected\ndeaths"
+  ) +
+  coord_equal(xlim = c(0, 4.3), ylim = c(0, 4.3)) +
+  labs(x = "Raw SMR", y = "Smoothed SMR (independent random effects)") +
+  theme_bw()
+```
+
+This is the same partial pooling we saw for movies in Notes 7 and states in Notes 8. Big counties like Hidalgo stay put, while Loving County goes from an SMR of $0$ to about $1.06$ and Kenedy County goes from $4.2$ to $1.6$. Lamb County is interesting: it is not big (about 13,000 people), but it had 68 deaths against 17 expected, which is enough evidence that the model barely shrinks it.
+
+
+# Dependence Across Neighborhoods
+
+The Poisson loglinear GLMM improves this, but completely ignores the spatial structure. The model shrinks every county toward the same statewide value $e^{\beta_0}$. But it seems like we know more than that. Kenedy County borders Hidalgo County, which had about three times the expected deaths, and the model ignores this completely. The natural thing to do is to shrink each county toward its _neighbors_ instead.
+
+In this section, we show how to do this. First, however, we need to decide, for each county, which counties are its neighbors. 
+
+## Who Are My Neighbors?
+
+For point-referenced data, spatial structure came from the distances $\|s_i - s_{i'}\|$. For areal data, the usual approach is to encode spatial structure through an _adjacency matrix_ $\bW$ with entries
+
+$$
+  w_{ij} = \begin{cases}
+    1 & \text{if regions $i$ and $j$ share a border,} \\
+    0 & \text{otherwise,}
+  \end{cases}
+$$
+
+with $w_{ii} = 0$. We write $i \sim j$ when $i$ and $j$ are neighbors, and $n_i = \sum_j w_{ij}$ for the number of neighbors of region $i$.
+
+
+We can get the neighbors using the `st_touches()` function from the `sf` package, which counts two counties as neighbors if their borders touch at all (even at a single corner point):
+
+```{r}
+#| label: tx-neighbors
+#| dependson: tx-iid
+
+## For each county, the indices of the counties that border it
+tx_nb <- st_touches(tx)
+
+## Adjacency matrix: W[i, j] = 1 if counties i and j share a border
+tx_W <- 1 * as.matrix(tx_nb)
+```
+
+The `tx_nb` object stores information as a list, with each list entry containing a list of who the neighbors of that county are:
+
+```{r}
+print(tx_nb)
+```
+
+The `tx_W` object stores this as a matrix, which is nicer mathematically but not convenient for printing. Instead, we will use it to count the number of neighbors for each county:
+
+```{r}
+#| label: how-neigh
+## How many neighbors do the counties have?
+table(rowSums(tx_W))
+```
+
+
+Most Texas counties have between 4 and 7 neighbors. El Paso County has only one (Hudspeth County) because the rest of its border is with New Mexico and Mexico, while Crockett County has nine. @fig-tx-neighbors shows the resulting _neighbor graph_, with a line connecting each pair of neighboring counties. The "X" patterns in the Panhandle come from counties on a grid that touch only at their corners.
+
+```{r, fig.width = 6.5, fig.height = 6}
+#| label: fig-tx-neighbors
+#| dependson: tx-neighbors
+#| echo: false
+#| fig-cap: "The neighbor graph for Texas counties. Each line connects the centers of two counties that share a border."
+
+tx_centers <- st_point_on_surface(st_geometry(tx))
+center_xy <- st_coordinates(tx_centers)
+
+## One row per pair of neighbors
+tx_edges <- tibble(
+  i = rep(seq_along(tx_nb), lengths(tx_nb)),
+  j = unlist(tx_nb)
+) %>%
+  filter(i < j) %>%
+  mutate(
+    x = center_xy[i, 1], y = center_xy[i, 2],
+    xend = center_xy[j, 1], yend = center_xy[j, 2]
+  )
+
+ggplot() +
+  geom_sf(data = tx, fill = "grey95", color = "grey70", linewidth = 0.2) +
+  geom_segment(
+    data = tx_edges,
+    aes(x = x, y = y, xend = xend, yend = yend),
+    color = "#2166AC",
+    linewidth = 0.3
+  ) +
+  geom_sf(data = tx_centers, size = 0.5) +
+  theme_void()
+```
+
+There are other reasonable ways to define neighbors. We could require counties to share an actual edge (not just a corner), use the $k$ nearest counties, or use all counties within some distance. For counties, sharing a border is the standard choice, and I wouldn't lose sleep over it.
+
+## Do We Need a Spatial Model? Moran's I
+
+In Notes 10, we checked for spatial dependence by mapping the residuals of a non-spatial model. Here, the analog of the residuals are the predicted random effects $\widehat u_i$ from the independent model: they capture whatever the model couldn't explain about each county. A standard way to measure spatial dependence in areal data is _Moran's I_:
+
+$$
+  I = \frac{N}{\sum_{i,j} w_{ij}} \cdot
+  \frac{\sum_{i} \sum_{j} w_{ij} \, (x_i - \bar x)(x_j - \bar x)}{\sum_i (x_i - \bar x)^2}.
+$$
+
+The numerator adds up $(x_i - \bar x)(x_j - \bar x)$ over all pairs of neighbors, and this product is positive when both neighbors are on the same side of the average. So Moran's I behaves a lot like a correlation between each region and its neighbors:
+
+- $I \approx 0$ means there is no spatial association (technically, the expected value is $-1/(N - 1)$ under no dependence, which is basically zero here).
+- $I > 0$ means neighbors tend to be similar.
+- $I < 0$ means neighbors tend to be _different_, like a checkerboard. This is pretty rare in practice.
+
+To decide whether $I$ is "big," we can use a _permutation test_: randomly shuffle the values across counties, which destroys any spatial structure, and recompute $I$. Doing this many times shows us what $I$ looks like when there is no spatial dependence.
+
+```{r}
+#| label: tx-moran
+#| dependson: tx-neighbors
+
+moran_I <- function(x, W) {
+  z <- x - mean(x)
+  (length(x) / sum(W)) * sum(z * (W %*% z)) / sum(z^2)
+}
+
+## Predicted county effects from the independent random effects model
+u_iid <- predict(tx_iid, type = "terms")[, "s(county)"]
+moran_obs <- moran_I(u_iid, tx_W)
+
+## Permutation test: shuffling the counties breaks any spatial structure
+set.seed(354)
+moran_perm <- replicate(2000, moran_I(sample(u_iid), tx_W))
+
+c(observed = moran_obs, p_value = mean(moran_perm >= moran_obs))
+```
+
+The observed value is $I \approx 0.49$, and none of the 2,000 shuffled datasets came anywhere close. @fig-tx-moran shows what is going on. The left panel is a _Moran scatterplot_ that plots each county's effect against the average of its neighbors' effects: counties with higher-than-expected risk tend to be next to other counties with higher-than-expected risk.
+
+```{r, fig.width = 9, fig.height = 4}
+#| label: fig-tx-moran
+#| dependson: tx-moran
+#| echo: false
+#| message: false
+#| fig-cap: "Left: each county's predicted effect from the independent random effects model against the average of its neighbors' effects. Right: Moran's I for 2,000 random shuffles of the effects across counties, with the observed value in red."
+
+moran_df <- tibble(u = u_iid, u_neighbors = drop(tx_W %*% u_iid) / rowSums(tx_W))
+
+p_scatter <- ggplot(moran_df, aes(x = u, y = u_neighbors)) +
+  geom_hline(yintercept = 0, color = "grey60") +
+  geom_vline(xintercept = 0, color = "grey60") +
+  geom_point(alpha = 0.5) +
+  geom_smooth(method = "lm", se = FALSE, color = "#B2182B") +
+  labs(x = expression("County effect " * hat(u)[i]),
+       y = "Average of neighbors' effects") +
+  theme_bw()
+
+p_perm <- ggplot(tibble(I = moran_perm), aes(x = I)) +
+  geom_histogram(bins = 40, fill = "grey70", color = "white") +
+  geom_vline(xintercept = moran_obs, color = "#B2182B", linewidth = 1) +
+  annotate("text", x = moran_obs, y = Inf, label = "observed",
+           vjust = 1.5, hjust = 1.1, color = "#B2182B") +
+  labs(x = "Moran's I (shuffled data)", y = "Count") +
+  theme_bw()
+
+p_scatter + p_perm
+```
+
+
+# Conditional Autoregressive Models
+
+We are, finally, in a position to fit a model that accounts for the neighborhood structure. The simplest models for doing this are _conditional autoregressive_ (CAR) models. We will first consider a special case called the _intrinsic CAR_ (ICAR) model, which is very easy to specify.
+
+
+## The Intrinsic CAR Model
+
+To build in spatial structure, we will replace the independent effects $u_i$ with spatial random effects $b_i$ that are correlated with their neighbors. This is similar to what we did in Notes 10, except that we use the adjacency matrix to induce the correlation, rather than using the distance between points. 
+
+The _intrinsic conditional autoregressive_ (ICAR) model specifies dependence in the $b_i$'s by specifying its conditional distribution *given all the other $b_i$'s*:
+
+$$
+  b_i \mid b_{-i} \sim \Normal\left(\frac{1}{n_i} \sum_{j \sim i} b_j, \ \frac{\sigma^2_b}{n_i}\right),
+$$
+
+where $b_{-i}$ denotes all of the $b_j$'s except for $b_i$ and recall that $n_i$ is the number of neighbors. This model has two intuitive features:
+
+1. The conditional mean of $b_i$ is the _average of its neighbors_. If we knew the effects of all the surrounding counties, our best guess for county $i$ would be their average.
+2. The conditional variance is $\sigma^2_b / n_i$, so counties with more neighbors are pinned down more tightly by them.
+
+The full model is then
+
+$$
+  Y_i \sim \Poisson(E_i \, \theta_i), \qquad
+  \log \theta_i = \beta_0 + b_i,
+$$
+
+with $\bb = (b_1, \ldots, b_N)^\top$ following the ICAR model.
+
+__What does the joint distribution look like?__ The conditional specification is very indirect, and does not give us the joint density. It turns out, however, that the ICAR model arises from assuming the $b_i$'s come from a certain multivariate normal distribution, with joint density
+
+$$
+  p(\bb) \propto \exp\left\{-\frac{1}{2 \sigma^2_b} \sum_{i \sim j} (b_i - b_j)^2\right\}
+$$
+
+where the sum is over all pairs of neighbors (counting each pair once). This is a nice way to think about the model: it _penalizes differences between neighbors_, i.e., the density is largest where neighboring counties have similar values. This is very similar to how the smoothing splines in Notes 9 penalize wiggly functions, and in fact `mgcv` treats this as just another kind of smooth.
+
+
+In matrix form, $\sum_{i \sim j} (b_i - b_j)^2 = \bb^\top (\bD - \bW) \bb$, where $\bD$ is the diagonal matrix with the neighbor counts $n_1, \ldots, n_N$ on the diagonal. So $\bb$ is multivariate normal with _inverse covariance matrix_
+
+$$
+  \bQ = \frac{\bD - \bW}{\sigma^2_b}.
+$$
+
+:::{.callout-note}
+#### Impropriety
+
+Technically, this description of the ICAR as coming from a multivariate normal is not quite correct because $\bQ$ does not have an inverse matrix. Fundamentally, the problem is that if we add the same constant to every $b_i$, none of the differences $b_i - b_j$ change, so the "density" can't tell what the overall level of $\bb$ is. One way to fix this is to instead use the _Moore-Penrose pseudoinverse_ as a replacement for $\bQ^{-1}$ for the covariance matrix, which is equivalent to imposing the constraint $\sum_i b_i = 0$ (assuming the adjacency graph is connected). In practice, `gam()` handles this for us automatically. Imposing $\sum_i b_i = 0$ is not a problem because the overall location can be absorbed into the intercept $\beta_0$.
+
+:::
+
+
+## Precision Versus Covariance
+
+The Gaussian process in Notes 10 specified the _covariance_ $\Sigma$ of the random effects directly. The CAR model instead specifies the _precision_ $\bQ = \Sigma^{-1}$. These are just two different ways of writing down a multivariate normal distribution, but they behave quite differently:
+
+- __Zeros in $\bQ$ mean conditional independence.__ If counties $i$ and $j$ are not neighbors then $Q_{ij} = 0$, which means $b_i$ and $b_j$ are independent _given all the other counties_. They are _not_ independent marginally: dependence spreads through chains of neighbors, so that Travis County is correlated with Williamson County, which is correlated with Bell County, and so on.
+- __Sparse precision matrices are fast.__ Each Texas county has only about six neighbors, so only about 2.6% of the $254 \times 254 = 64{,}516$ entries of $\bQ$ are nonzero. Software that exploits this sparsity (such as INLA or Stan) can handle maps with many thousands of regions. `gam()` doesn't really take advantage of it, but with only 254 counties it doesn't need to, and we can use one effect per county without the basis function approximations we used for Gaussian processes in Notes 10.
+
+To get a feel for what the ICAR model "thinks" a map should look like, @fig-tx-prior-draws shows random draws of $\bb$ from the independent model and from the ICAR model. The independent draws look like static, while the ICAR draws have large regions of high and low values, which is much closer to what @fig-tx-smr looks like.
+
+```{r, fig.width = 8, fig.height = 7}
+#| label: fig-tx-prior-draws
+#| dependson: tx-neighbors
+#| echo: false
+#| fig-cap: "Random draws of county effects from the independent model (top) and the ICAR model (bottom). The ICAR draws are scaled so that the average variance is 1, matching the independent draws."
+
+## Draw from the ICAR model using the eigendecomposition of D - W,
+## dropping the zero eigenvalue (this enforces the sum-to-zero constraint)
+Q_icar <- diag(rowSums(tx_W)) - tx_W
+Q_eigen <- eigen(Q_icar, symmetric = TRUE)
+keep <- Q_eigen$values > 1e-8
+V <- Q_eigen$vectors[, keep]
+lambda <- Q_eigen$values[keep]
+
+## Average marginal variance, used to put the draws on the same scale
+icar_scale <- sqrt(mean(rowSums(sweep(V^2, 2, lambda, "/"))))
+draw_icar <- function() drop(V %*% (rnorm(length(lambda)) / sqrt(lambda))) / icar_scale
+
+set.seed(11)
+prior_draws <- bind_rows(
+  tx %>% mutate(value = rnorm(n()), model = "Independent", draw = "Draw 1"),
+  tx %>% mutate(value = rnorm(n()), model = "Independent", draw = "Draw 2"),
+  tx %>% mutate(value = draw_icar(), model = "ICAR", draw = "Draw 1"),
+  tx %>% mutate(value = draw_icar(), model = "ICAR", draw = "Draw 2")
+) %>%
+  mutate(model = factor(model, levels = c("Independent", "ICAR")))
+
+ggplot(prior_draws) +
+  county_layer(aes(fill = value)) +
+  facet_grid(model ~ draw) +
+  scale_fill_gradient2(
+    low = "#2166AC", mid = "grey97", high = "#B2182B",
+    limits = c(-2.5, 2.5), oob = scales::squish, name = "Effect"
+  ) +
+  theme_void() +
+  theme(strip.text = element_text(size = 11, margin = margin(4, 4, 4, 4)))
+```
+
+
+## Structured Plus Unstructured: The BYM Model
+
+The ICAR model encourages the $b_i$ of every county to look like its neighbors. But sometimes a county is just _different_ from its neighbors. A single outbreak at a nursing home, prison, or meatpacking plant can produce a lot of deaths in one small county without affecting the counties around it. Additionally, we might worry about *overdispersion* in the counts, which we may not want to handle only via the spatial random effect $b_i$.
+
+The _BYM model_ (after Besag, York, and Mollié) allows for this by including both kinds of random effects:
+
+$$
+  \log \theta_i = \beta_0 + b_i + u_i,
+  \qquad \bb \sim \text{ICAR}(\sigma^2_b),
+  \qquad u_i \stackrel{\text{iid}}{\sim} \Normal(0, \sigma^2_u).
+$$
+
+The _structured_ effect $b_i$ captures risk that is shared with the neighbors, while the _unstructured_ effect $u_i$ captures whatever is idiosyncratic to county $i$. Comparing $\sigma_b$ and $\sigma_u$ gives a rough sense of how much of the variation in risk is spatial, although the comparison is not apples-to-apples: $\sigma_b$ is a conditional standard deviation, and the marginal variance of $b_i$ also depends on the shape of the neighbor graph.
+
+A potential problem is that the count depends on $u_i$ and $b_i$ only through $b_i + u_i$, so the split between the two can be poorly determined. There are other variations on this idea that can be helpful here, but for the purpose of this class knowing the BYM model is enough.
+
+# Fitting Areal Models with `mgcv`
+
+## The `mrf` Smooth
+
+
+Truly a useful function, `gam()` can also handle the ICAR model through the smooth type `bs = "mrf"`, which stands for _Markov random field_ (a general name for models built from neighbor relationships). We need to give it the neighbors as a list, named using the levels of the factor that identifies the regions:
+
+```{r}
+#| label: tx-fit-spatial
+#| dependson: tx-moran
+
+## Convert the neighbors to an ordinary list, named by county FIPS code
+tx_nb_list <- lapply(tx_nb, identity)
+names(tx_nb_list) <- levels(tx_df$county)
+
+## gam() gets confused when the same variable appears in two smooths, so
+## the spatial effect gets its own copy of the county factor
+tx_df$region <- tx_df$county
+
+## ICAR model
+tx_icar <- gam(
+  deaths ~ s(region, bs = "mrf", xt = list(nb = tx_nb_list)) +
+    offset(log(E)),
+  family = poisson,
+  data = tx_df,
+  method = "REML"
+)
+
+## BYM model: ICAR plus independent effects
+tx_bym <- gam(
+  deaths ~ s(region, bs = "mrf", xt = list(nb = tx_nb_list)) +
+    s(county, bs = "re") +
+    offset(log(E)),
+  family = poisson,
+  data = tx_df,
+  method = "REML"
+)
+
+gam.vcomp(tx_bym)
+```
+
+
+The first row gives $\widehat \sigma_b \approx 0.69$ for the spatial effect and the second gives $\widehat \sigma_u \approx 0.17$ for the independent effect. Keep in mind that $\sigma_b$ is a _conditional_ standard deviation: for a county with six neighbors, the standard deviation of $b_i$ given its neighbors is $0.69 / \sqrt 6 \approx 0.28$. Even so, the independent part is small, which suggests that most of the county-to-county variation in risk is shared with the neighbors.
+
+By default, `bs = "mrf"` uses the full ICAR model with one $b_i$ per region. You can set `k` to something smaller to get a low-rank approximation, which is useful when there are many thousands of regions, but with 254 counties there is no need.
+
+
+## Comparing the Models
+
+Since the independent, ICAR, and BYM models all have the same fixed effects (just an intercept), we can compare them using the REML criterion, just like we did when choosing $\phi$ in Notes 10:
+
+```{r}
+#| label: tx-compare
+#| dependson: tx-fit-spatial
+
+## The REML criterion for each fit; smaller is better
+tibble(
+  model = c("Independent", "ICAR", "BYM"),
+  reml = c(tx_iid$gcv.ubre, tx_icar$gcv.ubre, tx_bym$gcv.ubre)
+)
+```
+
+Adding spatial structure improves the REML criterion by about 66, which is a lot. Going from ICAR to BYM improves it by less than 1, which matches the small $\widehat \sigma_u$. We'll use the BYM model from here on since it is the standard default in disease mapping, but the maps from the ICAR model would look almost identical.
+
+
+## Visualizing the Smoothed Risk
+
+@fig-tx-smr-compare shows the raw SMRs next to the smoothed SMRs from the independent and BYM models, all on the same color scale. Both models get rid of the noise from the small counties, but in different ways. The independent model pulls small counties toward the statewide value, so they fade to white. The BYM model pulls them toward their neighbors, so the regional patterns (high risk along the border and around Lubbock, low risk around Austin and San Antonio) come through more clearly.
+
+```{r, fig.width = 9, fig.height = 4}
+#| label: fig-tx-smr-compare
+#| dependson: tx-fit-spatial
+#| echo: false
+#| fig-cap: "Raw SMRs (left), smoothed SMRs from the independent random effects model (middle), and smoothed SMRs from the BYM model (right)."
+
+tx_df$smr_bym <- exp(predict(tx_bym) - log(tx_df$E))
+
+smr_maps <- bind_rows(
+  tx %>% mutate(value = tx_df$smr, panel = "Raw SMR"),
+  tx %>% mutate(value = tx_df$smr_iid, panel = "Independent"),
+  tx %>% mutate(value = tx_df$smr_bym, panel = "BYM")
+) %>%
+  mutate(panel = factor(panel, levels = c("Raw SMR", "Independent", "BYM")))
+
+ggplot(smr_maps) +
+  county_layer(aes(fill = clip_log(value))) +
+  facet_wrap(~ panel, nrow = 1) +
+  smr_scale() +
+  theme_void() +
+  theme(
+    legend.position = "bottom",
+    strip.text = element_text(size = 11, margin = margin(4, 4, 4, 4))
+  )
+```
+
+
+@fig-tx-where zooms in on a few counties to show where each model moves them. For each county, the top arrow goes from the raw SMR to the independent-model estimate and the bottom arrow goes from the raw SMR to the BYM estimate. The black crosses show the pooled SMR of each county's neighbors, $\sum_{j \sim i} Y_j / \sum_{j \sim i} E_j$.
+
+```{r, fig.width = 7.5, fig.height = 4.5}
+#| label: fig-tx-where
+#| dependson: tx-fit-spatial
+#| echo: false
+#| fig-cap: "Where the models move a few counties. Top arrows: raw SMR to the independent-model estimate. Bottom arrows: raw SMR to the BYM estimate. Black crosses: the pooled SMR of the county's neighbors."
+
+where_counties <- c("Hidalgo", "Lamb", "Kenedy", "Jeff Davis", "Borden",
+                    "King", "Loving")
+
+where_df <- tx_df %>%
+  mutate(
+    neighbor_smr = map_dbl(tx_nb, function(j) sum(deaths[j]) / sum(E[j]))
+  ) %>%
+  filter(name %in% where_counties) %>%
+  mutate(
+    label = paste0(name, " (pop. ", scales::comma(pop), ")"),
+    y = match(name, rev(where_counties))
+  )
+
+where_arrows <- bind_rows(
+  where_df %>% transmute(y = y + 0.17, start = smr, end = smr_iid,
+                         model = "Independent"),
+  where_df %>% transmute(y = y - 0.17, start = smr, end = smr_bym,
+                         model = "BYM")
+) %>%
+  mutate(model = factor(model, levels = c("Independent", "BYM")))
+
+ggplot() +
+  geom_vline(xintercept = 1, color = "grey60") +
+  geom_segment(
+    data = where_arrows,
+    aes(x = start, xend = end, y = y, yend = y, color = model),
+    arrow = arrow(length = unit(0.15, "cm"), type = "closed"),
+    linewidth = 0.7
+  ) +
+  geom_point(data = where_arrows, aes(x = start, y = y), shape = 21,
+             fill = "white", size = 2) +
+  geom_point(data = where_df, aes(x = neighbor_smr, y = y - 0.17),
+             shape = 4, size = 2.5, stroke = 1.2) +
+  scale_color_manual(values = c("grey55", "#B2182B"), name = NULL) +
+  scale_y_continuous(breaks = where_df$y, labels = where_df$label) +
+  labs(x = "SMR", y = NULL) +
+  theme_bw() +
+  theme(legend.position = "bottom", panel.grid.minor = element_blank())
+```
+
+A few things to notice:
+
+- __Kenedy County__ (346 residents) had a raw SMR of $4.2$. The independent model pulls it down to $1.6$, but the BYM model only pulls it down to $2.8$ because its neighbors, which include Hidalgo County, had about three times the expected deaths.
+- __Loving, King, and Borden Counties__ all had zero deaths, but they sit in parts of West Texas where risk was high, so the BYM model puts them _above_ $1$ (between about $1.55$ and $1.70$). The independent model puts them close to the statewide value instead.
+- __Jeff Davis County__ had one death against about five expected. The BYM model pulls it toward its neighbors, ending up close to $1$.
+- __Hidalgo and Lamb Counties__ have enough data that neither model moves them much.
+
+
+## How Sure Are We? Exceedance Probabilities
+
+A common output of a disease mapping analysis is the _exceedance probability_ $\Pr(\theta_i > 1 \mid \bY)$ for each county, which is the probability that the county's relative risk is higher than that of the state as a whole. We can compute these using simulation, similar to Notes 8. `mgcv` gives an approximate posterior distribution for all of the model coefficients (the intercept and the random effects), which is normal with mean `coef(tx_bym)` and covariance `vcov(tx_bym)`, so we can draw from it with `rmvn()`. Setting `unconditional = TRUE` also accounts for our uncertainty in the variance components $\sigma_b$ and $\sigma_u$, rather than treating them as known:
+
+```{r}
+#| label: tx-exceed
+#| dependson: tx-fit-spatial
+
+## Each row of the "lpmatrix" maps the coefficients to the linear
+## predictor for one county; it leaves out the offset, so X %*% beta is
+## log(theta)
+X_lp <- predict(tx_bym, type = "lpmatrix")
+
+set.seed(354)
+coef_draws <- rmvn(4000, coef(tx_bym), vcov(tx_bym, unconditional = TRUE))
+log_theta_draws <- X_lp %*% t(coef_draws)  # 254 counties by 4000 draws
+
+tx_df$p_exceed <- rowMeans(log_theta_draws > 0)
+
+## How many counties are confidently above or below the state?
+table(cut(tx_df$p_exceed, c(0, 0.05, 0.95, 1), include.lowest = TRUE))
+```
+
+```{r, fig.width = 6.5, fig.height = 6}
+#| label: fig-tx-exceed
+#| dependson: tx-exceed
+#| echo: false
+#| fig-cap: "Exceedance probabilities from the BYM model: the probability that a county's relative risk is greater than 1."
+
+ggplot(tx %>% mutate(p_exceed = tx_df$p_exceed)) +
+  county_layer(aes(fill = p_exceed)) +
+  city_layers +
+  scale_fill_gradient2(
+    low = "#2166AC", mid = "grey97", high = "#B2182B",
+    midpoint = 0.5, limits = c(0, 1),
+    name = "Pr(relative\nrisk > 1)"
+  ) +
+  theme_void()
+```
+
+@fig-tx-exceed maps the exceedance probabilities. Under the fitted model, dark red counties have a high posterior probability of having higher risk than the state as a whole, and dark blue counties a high probability of having lower risk. About a third of the counties (87 of them) have an exceedance probability above $0.95$ and another 62 have one below $0.05$. The remaining counties are uncertain.
+
+# Adding Covariates
+
+## Ecological Regression
+
+
+So far we have only _described_ where the risk was high. The natural next question is _why_. We'll consider three county characteristics from the County Health Rankings, mapped in @fig-tx-covariates:
+
+- `uninsured`: the percentage of people under 65 without health insurance;
+- `rural`: the percentage of residents living in rural areas; and
+- `income`: the median household income.
+
+```{r, fig.width = 9, fig.height = 3.8}
+#| label: fig-tx-covariates
+#| dependson: tx-load
+#| echo: false
+#| fig-cap: "County characteristics used as predictors."
+
+covariate_map <- function(variable, name, labels) {
+  ggplot(tx) +
+    county_layer(aes(fill = {{ variable }})) +
+    scale_fill_viridis_c(name = name, labels = labels) +
+    theme_void() +
+    theme(legend.position = "bottom", legend.key.width = unit(0.8, "cm"))
+}
+
+covariate_map(uninsured, "Uninsured", scales::label_percent()) +
+  covariate_map(rural, "Rural", scales::label_percent()) +
+  covariate_map(income, "Median income",
+                scales::label_dollar(scale = 1e-3, suffix = "k"))
+```
+
+
+Adding these to the BYM model gives
+
+$$
+  \log \theta_i = \beta_0
+    + \beta_1 \, \texttt{uninsured\_pct}_i
+    + \beta_2 \, \texttt{rural\_pct}_i
+    + \beta_3 \, \log(\texttt{income}_i)
+    + b_i + u_i.
+$$
+
+A regression like this, where both the outcome and predictors are summaries of regions, is called an _ecological regression_. We will fit both the BYM model and a non-spatial quasi-Poisson GLM (which accounts for overdispersion, but not spatial dependence):
+
+```{r}
+#| label: tx-fit-covariates
+#| dependson: tx-fit-spatial
+
+tx_df <- tx_df %>%
+  mutate(
+    uninsured_pct = 100 * uninsured,
+    rural_pct = 100 * rural,
+    log_income = log(income)
+  )
+
+## Non-spatial model
+tx_glm_x <- glm(
+  deaths ~ uninsured_pct + rural_pct + log_income + offset(log(E)),
+  family = quasipoisson,
+  data = tx_df
+)
+
+## BYM model with covariates
+tx_bym_x <- gam(
+  deaths ~ uninsured_pct + rural_pct + log_income +
+    s(region, bs = "mrf", xt = list(nb = tx_nb_list)) +
+    s(county, bs = "re") +
+    offset(log(E)),
+  family = poisson,
+  data = tx_df,
+  method = "REML"
+)
+
+summary(tx_glm_x)
+summary(tx_bym_x)
+```
+
+The coefficients are interpreted as in any Poisson log-linear model: holding the other predictors (and the random effects) fixed, increasing $\texttt{uninsured\_pct}$ by $10$ percentage points multiplies the relative risk by $e^{10 \beta_1}$. For income, a $10\%$ increase multiplies the relative risk by $1.1^{\beta_3}$. The table below gives these rate ratios, with 95% confidence intervals, for both models:
+
+```{r}
+#| label: tx-covariate-table
+#| dependson: tx-fit-covariates
+#| echo: false
+
+## Rate ratios: 10 percentage points for the percentages, 10% for income
+rr_table <- function(estimate, se) {
+  multiplier <- c(10, 10, log(1.1))
+  sprintf(
+    "%.2f (%.2f, %.2f)",
+    exp(multiplier * estimate),
+    exp(multiplier * (estimate - 1.96 * se)),
+    exp(multiplier * (estimate + 1.96 * se))
+  )
+}
+
+glm_coef <- summary(tx_glm_x)$coefficients[2:4, ]
+bym_coef <- summary(tx_bym_x)$p.table[2:4, ]
+
+tibble(
+  Predictor = c("Uninsured", "Rural", "Median income"),
+  Change = c("+10 percentage points", "+10 percentage points", "+10%"),
+  `Non-spatial` = rr_table(glm_coef[, 1], glm_coef[, 2]),
+  BYM = rr_table(bym_coef[, 1], bym_coef[, 2])
+) %>%
+  knitr::kable()
+```
+
+All three predictors are associated with mortality in both models. Counties with more uninsured residents and lower incomes had higher age-adjusted mortality, and more rural counties had somewhat _lower_ mortality after accounting for the other two. But the size of the associations changes quite a bit:
+
+- __Uninsured:__ the non-spatial model says a 10-point increase in the uninsured rate goes with about 42% higher mortality, while the BYM model says about 22%.
+- __Income:__ the non-spatial model says a 10% increase in median income goes with about 14% lower mortality, while the BYM model says about 8%.
+- __Rural:__ basically unchanged.
+
+This is the spatial confounding story from Notes 10 again. The counties along the Rio Grande have high uninsured rates, low incomes, _and_ very high mortality, and they are all next to each other. The non-spatial model gives the predictors all the credit for this regional pattern. The BYM model attributes part of it to the spatial effect $b_i$, so its coefficients lean more heavily on comparisons between nearby counties. Neither answer is "right" in general, but the two models are answering different questions.
+
+__Ecological coefficients are fragile.__ To make this point more strongly, here is what happens to the BYM model when we also include the percentage of residents who are Hispanic:
+
+```{r}
+#| label: tx-fit-hispanic
+#| dependson: tx-fit-covariates
+
+tx_df$hispanic_pct <- 100 * tx_df$hispanic
+tx_bym_x2 <- gam(
+  deaths ~ uninsured_pct + rural_pct + log_income + hispanic_pct + 
+    s(region, bs = "mrf", xt = list(nb = tx_nb_list)) +
+    s(county, bs = "re") +
+    offset(log(E)),
+  family = poisson,
+  data = tx_df,
+  method = "REML"
+)
+
+## Rate ratios for a 10 percentage point increase
+exp(10 * coef(tx_bym_x2)[c("uninsured_pct", "hispanic_pct")])
+```
+
+The uninsured association disappears completely, and each additional 10 percentage points of Hispanic residents goes with about 18% higher mortality. The uninsured and Hispanic percentages are correlated (about $0.38$ across counties) and both are concentrated in the same parts of the state, so the data have a hard time telling them apart. The Hispanic percentage is also not a "cause" of anything by itself. It is standing in for things we didn't measure that put Hispanic Texans at higher risk during 2020, such as jobs that could not be done from home and larger households.
+
+:::{.callout-warning}
+#### The Ecological Fallacy
+
+A county-level association does not tell us about individuals. Finding that counties with more uninsured residents had higher mortality does _not_ by itself mean that uninsured _people_ were more likely to die; it could be, for example, that everyone in those counties had higher risk for reasons related to the local economy or health care system. Drawing individual-level conclusions from area-level associations is known as the _ecological fallacy_. To study individual risk factors, we need individual-level data.
+:::
+
+
+## How Much of the Map Did the Covariates Explain?
+
+Comparing the spatial effects $b_i$ with and without covariates shows how much of the geography the covariates account for. The estimated $\sigma_b$ drops from about $0.69$ to about $0.58$:
+
+```{r}
+#| label: tx-vcomp-covariates
+#| dependson: tx-fit-covariates
+gam.vcomp(tx_bym_x)
+```
+
+@fig-tx-spatial-effect maps $e^{\widehat b_i}$ for both models. The covariates explain a good part of the high risk along the border, which makes sense since that is where uninsured rates are highest and incomes are lowest. But the high-risk region around Lubbock and the low-risk region in Central Texas are essentially untouched, so whatever drove those differences was not captured by these three variables.
+
+```{r, fig.width = 9, fig.height = 4.5}
+#| label: fig-tx-spatial-effect
+#| dependson: tx-fit-covariates
+#| echo: false
+#| fig-cap: 'The spatial part of the relative risk, $e^{\widehat b_i}$, from the BYM model without covariates (left) and with covariates (right).'
+
+spatial_maps <- bind_rows(
+  tx %>% mutate(
+    value = predict(tx_bym, type = "terms")[, "s(region)"],
+    panel = "Without covariates"
+  ),
+  tx %>% mutate(
+    value = predict(tx_bym_x, type = "terms")[, "s(region)"],
+    panel = "With covariates"
+  )
+) %>%
+  mutate(panel = factor(panel, levels = c("Without covariates",
+                                          "With covariates")))
+
+ggplot(spatial_maps) +
+  county_layer(aes(fill = clip_log(exp(value)))) +
+  facet_wrap(~ panel) +
+  smr_scale(name = "Spatial part of\nrelative risk") +
+  theme_void() +
+  theme(strip.text = element_text(size = 11, margin = margin(4, 4, 4, 4)))
+```
+
+
+# Checking and Caveats
+
+## Is There Still Leftover Dependence?
+
+We can use Moran's I to check whether we still need the spatial effect once the covariates are in the model. Below, we fit the model with covariates and only independent random effects, and then compute Moran's I for its predicted effects $\widehat u_i$. We also compute Moran's I for the independent part $\widehat u_i$ of the BYM model with covariates:
+
+```{r}
+#| label: tx-moran-check
+#| dependson: tx-fit-covariates
+
+## Covariates plus independent random effects only
+tx_iid_x <- gam(
+  deaths ~ uninsured_pct + rural_pct + log_income +
+    s(county, bs = "re") + offset(log(E)),
+  family = poisson,
+  data = tx_df,
+  method = "REML"
+)
+
+u_iid_x <- predict(tx_iid_x, type = "terms")[, "s(county)"]
+u_bym_x <- predict(tx_bym_x, type = "terms")[, "s(county)"]
+
+c(
+  covariates_iid = moran_I(u_iid_x, tx_W),
+  bym_unstructured = moran_I(u_bym_x, tx_W)
+)
+```
+
+Without a spatial effect, Moran's I is still about $0.38$, so the covariates don't come close to explaining the spatial dependence, and we still need $b_i$. For the BYM model, Moran's I for $\widehat u_i$ is about $-0.13$, so there is no positive dependence left.
+
+## Caveats
+
+A few things to keep in mind when working with areal data:
+
+- __Edge effects.__ The model only knows about neighbors _inside_ Texas. El Paso County is right next to Ciudad Juárez and the Rio Grande Valley is right next to Reynosa and Matamoros, but as far as the model is concerned these counties are on the edge of the world.
+- __The regions are arbitrary.__ County lines were not drawn with disease in mind, and the results of an areal analysis can change if we aggregate the same data to different regions (for example, ZIP codes instead of counties). This is known as the _modifiable areal unit problem_.
+- __The covariates are estimates too.__ County-level measures like the uninsured rate are themselves estimated from surveys and statistical models, and they are noisy for small counties. We have treated them as known.
+- __Counting deaths is hard.__ Where and when a COVID-19 death gets recorded depends on local reporting practices, which differ across counties. Some of what we are calling "risk" may be differences in reporting.
